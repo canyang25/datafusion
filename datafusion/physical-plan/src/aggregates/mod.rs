@@ -3354,6 +3354,15 @@ pub fn get_finer_aggregate_exprs_requirement(
                         );
                     }
                 }
+            } else if forward_finer.is_some() {
+                // No reverse expression. A hard requirement still has to be
+                // requested, otherwise an ordered UDAF runs on unsorted input.
+                // https://github.com/apache/datafusion/issues/25676
+                requirement = Some(aggr_req);
+            } else if !include_soft_requirement {
+                return not_impl_err!(
+                    "Conflicting ordering requirements in aggregate functions is not supported"
+                );
             }
         }
     }
@@ -4886,6 +4895,98 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// A hard ordering requirement with no `reverse_expr` must still be
+    /// requested. Built-in ordered aggregates implement `reverse_expr`, so
+    /// they hide this. https://github.com/apache/datafusion/issues/25676
+    #[test]
+    fn hard_order_requirement_without_reverse_expr() -> Result<()> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let udaf = Arc::new(AggregateUDF::from(OrderOnlyUdaf {
+            signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+        }));
+        let aggregates = vec![Arc::new(
+            AggregateExprBuilder::new(udaf, vec![col("a", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("ordered(a)")
+                .order_by(vec![PhysicalSortExpr::new(
+                    col("b", &schema)?,
+                    SortOptions::default(),
+                )])
+                .build()?,
+        )];
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::default(),
+            aggregates,
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+
+        assert!(
+            aggregate.required_input_ordering()[0].is_some(),
+            "ORDER BY on a hard-requirement UDAF without reverse_expr was dropped"
+        );
+        Ok(())
+    }
+
+    /// UDAF that keeps the default hard ordering requirement and does not
+    /// implement `reverse_expr`.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct OrderOnlyUdaf {
+        signature: Signature,
+    }
+
+    impl AggregateUDFImpl for OrderOnlyUdaf {
+        fn name(&self) -> &str {
+            "order_only"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn accumulator(
+            &self,
+            _acc_args: AccumulatorArgs,
+        ) -> Result<Box<dyn Accumulator>> {
+            Ok(Box::new(OrderOnlyAccumulator))
+        }
+    }
+
+    #[derive(Debug)]
+    struct OrderOnlyAccumulator;
+
+    impl Accumulator for OrderOnlyAccumulator {
+        fn update_batch(&mut self, _values: &[ArrayRef]) -> Result<()> {
+            Ok(())
+        }
+
+        fn merge_batch(&mut self, _states: &[ArrayRef]) -> Result<()> {
+            Ok(())
+        }
+
+        fn evaluate(&mut self) -> Result<ScalarValue> {
+            Ok(ScalarValue::Int64(Some(0)))
+        }
+
+        fn state(&mut self) -> Result<Vec<ScalarValue>> {
+            Ok(vec![ScalarValue::Int64(Some(0))])
+        }
+
+        fn size(&self) -> usize {
+            size_of_val(self)
+        }
     }
 
     /// An accumulator that allocates its retained state in its constructor and keeps that
