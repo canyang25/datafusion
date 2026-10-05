@@ -33,7 +33,9 @@ use arrow::compute::{SlicesIterator, cast, filter, filter_record_batch};
 use arrow::datatypes::*;
 use arrow::error::ArrowError;
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, internal_err, not_impl_err,
+};
 
 use datafusion_expr::binary::BinaryTypeCoercer;
 use datafusion_expr::interval_arithmetic::{Interval, apply_operator};
@@ -537,6 +539,84 @@ where
     }
 }
 
+/// Integer `%` with PostgreSQL's result for `MIN % -1`.
+///
+/// Any integer divided by `-1` has remainder 0. Arrow's checked kernel still
+/// errors when the dividend is the minimum of a signed integer, because the
+/// quotient does not fit. Replace those divisors with `1` (same remainder)
+/// and compute again. Other errors, including division by zero, are unchanged.
+///
+/// <https://github.com/apache/datafusion/issues/14771>
+fn apply_modulo(lhs: &ColumnarValue, rhs: &ColumnarValue) -> Result<ColumnarValue> {
+    use arrow::compute::kernels::numeric::rem;
+
+    match apply(lhs, rhs, rem) {
+        Ok(result) => Ok(result),
+        Err(e) if is_arithmetic_overflow(&e) => {
+            let rhs = replace_signed_neg_one_divisor(rhs);
+            apply(lhs, &rhs, rem)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn is_arithmetic_overflow(err: &DataFusionError) -> bool {
+    matches!(
+        err.find_root(),
+        DataFusionError::ArrowError(arrow_err, _)
+            if matches!(arrow_err.as_ref(), ArrowError::ArithmeticOverflow(_))
+    )
+}
+
+fn replace_signed_neg_one_divisor(value: &ColumnarValue) -> ColumnarValue {
+    match value {
+        ColumnarValue::Scalar(scalar) => {
+            ColumnarValue::Scalar(replace_signed_neg_one_scalar(scalar))
+        }
+        ColumnarValue::Array(array) => {
+            ColumnarValue::Array(replace_signed_neg_one_array(array))
+        }
+    }
+}
+
+fn replace_signed_neg_one_scalar(scalar: &ScalarValue) -> ScalarValue {
+    match scalar {
+        ScalarValue::Int8(Some(-1)) => ScalarValue::Int8(Some(1)),
+        ScalarValue::Int16(Some(-1)) => ScalarValue::Int16(Some(1)),
+        ScalarValue::Int32(Some(-1)) => ScalarValue::Int32(Some(1)),
+        ScalarValue::Int64(Some(-1)) => ScalarValue::Int64(Some(1)),
+        other => other.clone(),
+    }
+}
+
+fn replace_signed_neg_one_array(array: &ArrayRef) -> ArrayRef {
+    match array.data_type() {
+        DataType::Int8 => replace_neg_one_primitive::<Int8Type>(array),
+        DataType::Int16 => replace_neg_one_primitive::<Int16Type>(array),
+        DataType::Int32 => replace_neg_one_primitive::<Int32Type>(array),
+        DataType::Int64 => replace_neg_one_primitive::<Int64Type>(array),
+        _ => Arc::clone(array),
+    }
+}
+
+fn replace_neg_one_primitive<T>(array: &ArrayRef) -> ArrayRef
+where
+    T: ArrowPrimitiveType,
+    T::Native: Copy + PartialEq + From<i8>,
+{
+    let values = array.as_primitive::<T>();
+    let neg_one = T::Native::from(-1_i8);
+    if !values.values().contains(&neg_one) {
+        return Arc::clone(array);
+    }
+    let one = T::Native::from(1_i8);
+    let replaced: PrimitiveArray<T> = values
+        .iter()
+        .map(|value| value.map(|item| if item == neg_one { one } else { item }))
+        .collect();
+    Arc::new(replaced)
+}
+
 impl PhysicalExpr for BinaryExpr {
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
         BinaryTypeCoercer::new(
@@ -662,7 +742,7 @@ impl PhysicalExpr for BinaryExpr {
             Operator::Multiply if self.fail_on_overflow => return apply(&lhs, &rhs, mul),
             Operator::Multiply => return apply(&lhs, &rhs, mul_wrapping),
             Operator::Divide => return apply(&lhs, &rhs, div),
-            Operator::Modulo => return apply(&lhs, &rhs, rem),
+            Operator::Modulo => return apply_modulo(&lhs, &rhs),
 
             Operator::Eq
             | Operator::NotEq
@@ -5552,6 +5632,108 @@ mod tests {
                 .to_string()
                 .contains("Overflow happened on: 2147483647 * 2")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_modulo_signed_min_by_negative_one() -> Result<()> {
+        // The remainder is 0. Arrow's checked kernel errors because the
+        // quotient does not fit. https://github.com/apache/datafusion/issues/14771
+        fn eval_mod(left: ArrayRef, right: ArrayRef) -> Result<ArrayRef> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("l", left.data_type().clone(), true),
+                Field::new("r", right.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::clone(&left), right],
+            )?;
+            let expr = BinaryExpr::new(
+                Arc::new(Column::new("l", 0)),
+                Operator::Modulo,
+                Arc::new(Column::new("r", 1)),
+            );
+            expr.evaluate(&batch)?.into_array(batch.num_rows())
+        }
+
+        let result = eval_mod(
+            Arc::new(Int32Array::from(vec![
+                Some(i32::MIN),
+                Some(5),
+                Some(-5),
+                Some(8),
+                Some(-5),
+                None,
+                Some(i32::MIN),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(-1),
+                Some(-1),
+                Some(-1),
+                Some(3),
+                Some(3),
+                Some(-1),
+                None,
+            ])),
+        )?;
+        assert_eq!(
+            result.as_ref(),
+            &Int32Array::from(vec![
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(2),
+                Some(-2),
+                None,
+                None,
+            ])
+        );
+
+        let schema = Arc::new(Schema::empty());
+        let batch = RecordBatch::new_empty(schema);
+        let scalar = BinaryExpr::new(
+            lit(ScalarValue::Int64(Some(i64::MIN))),
+            Operator::Modulo,
+            lit(ScalarValue::Int64(Some(-1))),
+        )
+        .evaluate(&batch)?;
+        match scalar {
+            ColumnarValue::Scalar(ScalarValue::Int64(Some(0))) => {}
+            other => panic!("expected scalar 0, got {other:?}"),
+        }
+
+        for (left, right) in [
+            (
+                Arc::new(Int8Array::from(vec![i8::MIN])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![-1])) as ArrayRef,
+            ),
+            (
+                Arc::new(Int16Array::from(vec![i16::MIN])),
+                Arc::new(Int16Array::from(vec![-1])),
+            ),
+            (
+                Arc::new(Int64Array::from(vec![i64::MIN])),
+                Arc::new(Int64Array::from(vec![-1])),
+            ),
+        ] {
+            let result = eval_mod(left, right)?;
+            assert_eq!(result.null_count(), 0);
+            assert_eq!(
+                ScalarValue::try_from_array(result.as_ref(), 0)?,
+                ScalarValue::new_zero(result.data_type())?
+            );
+        }
+
+        let err = eval_mod(
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![0])),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Divide by zero"),
+            "division by zero must still fail, got {err}"
+        );
+
         Ok(())
     }
 

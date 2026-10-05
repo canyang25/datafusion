@@ -1525,3 +1525,51 @@ SELECT gcd(column1, 0) FROM (VALUES (7), (-3), (0));
 7
 3
 0
+
+# Signed minimum divided by -1 has remainder 0. The quotient does not fit
+# in the integer type, but PostgreSQL still returns 0.
+# https://github.com/apache/datafusion/issues/14771
+query I
+SELECT arrow_cast(-2147483648, 'Int32') % arrow_cast(-1, 'Int32');
+----
+0
+
+query I
+SELECT arrow_cast(-9223372036854775808, 'Int64') % arrow_cast(-1, 'Int64');
+----
+0
+
+query I
+SELECT arrow_cast(-128, 'Int8') % arrow_cast(-1, 'Int8');
+----
+0
+
+query I
+SELECT arrow_cast(-32768, 'Int16') % arrow_cast(-1, 'Int16');
+----
+0
+
+statement ok
+CREATE TABLE t_mod(c1 INT, c2 INT) AS VALUES
+  (-2147483648, -1),
+  (5, -1),
+  (-5, 3),
+  (8, 3),
+  (NULL, -1),
+  (-2147483648, NULL);
+
+query I
+SELECT c1 % c2 FROM t_mod ORDER BY c1 NULLS LAST, c2 NULLS LAST;
+----
+0
+NULL
+-2
+0
+2
+NULL
+
+query error DataFusion error: Arrow error: Divide by zero error
+SELECT arrow_cast(1, 'Int32') % arrow_cast(0, 'Int32');
+
+statement ok
+DROP TABLE t_mod;
