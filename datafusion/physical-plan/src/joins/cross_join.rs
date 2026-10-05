@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use super::utils::{
     BuildProbeJoinMetrics, OnceAsync, OnceFut, adjust_right_output_partitioning,
-    reorder_output_after_swap,
 };
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
@@ -111,8 +110,12 @@ impl CrossJoinExec {
             let left_fields = left_schema.fields().iter();
             let right_fields = right_schema.fields().iter();
 
-            let mut metadata = left_schema.metadata().clone();
-            metadata.extend(right_schema.metadata().clone());
+            // Same precedence as `build_join_schema` for an inner join: when
+            // both sides set a schema metadata key, the left side wins.
+            // `HashMap::extend` keeps the later value, so start from the right.
+            // https://github.com/apache/datafusion/issues/23434
+            let mut metadata = right_schema.metadata().clone();
+            metadata.extend(left_schema.metadata().clone());
 
             (
                 left_fields.chain(right_fields).cloned().collect::<Fields>(),
@@ -188,13 +191,22 @@ impl CrossJoinExec {
     /// operators on the join's children. Check [`super::HashJoinExec::swap_inputs`]
     /// for more details.
     pub fn swap_inputs(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        let new_join =
-            CrossJoinExec::new(Arc::clone(&self.right), Arc::clone(&self.left));
-        reorder_output_after_swap(
-            Arc::new(new_join),
-            &self.left.schema(),
-            &self.right.schema(),
-        )
+        let new_join = Arc::new(CrossJoinExec::new(
+            Arc::clone(&self.right),
+            Arc::clone(&self.left),
+        ));
+        // `new` prefers the metadata of its left input. After the swap that
+        // input is the original right side, so the projection that restores
+        // column order must keep this node's schema metadata.
+        let proj = ProjectionExec::try_new_with_schema_metadata(
+            super::utils::swap_reverting_projection(
+                &self.left.schema(),
+                &self.right.schema(),
+            ),
+            new_join,
+            self.schema.as_ref(),
+        )?;
+        Ok(Arc::new(proj))
     }
 }
 
@@ -706,11 +718,17 @@ impl CrossJoinStream {
 mod tests {
     use super::*;
     use crate::common;
+    use crate::empty::EmptyExec;
+    use crate::joins::utils::build_join_schema;
     use crate::test::{assert_join_metrics, build_table_scan_i32};
 
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::JoinType;
     use datafusion_common::{assert_contains, test_util::batches_to_sort_string};
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use insta::assert_snapshot;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     async fn join_collect(
         left: Arc<dyn ExecutionPlan>,
@@ -931,6 +949,43 @@ mod tests {
             result.column_statistics[1].sum_value,
             Precision::Exact(ScalarValue::UInt64(Some(22)))
         );
+    }
+
+    #[test]
+    fn test_schema_metadata_matches_inner_join() -> Result<()> {
+        // Left metadata wins on a key collision, and keys present on only one
+        // side are kept. This is the schema `build_join_schema` produces for
+        // an inner join, which is what the logical cross join uses.
+        let left_schema = Arc::new(
+            Schema::new(vec![Field::new("a", DataType::Int32, false)]).with_metadata(
+                HashMap::from([
+                    ("pandas".to_string(), "LEFT-SCHEMA".to_string()),
+                    ("left_only".to_string(), "L".to_string()),
+                ]),
+            ),
+        );
+        let right_schema = Arc::new(
+            Schema::new(vec![Field::new("b", DataType::Int32, false)]).with_metadata(
+                HashMap::from([
+                    ("pandas".to_string(), "RIGHT-SCHEMA".to_string()),
+                    ("right_only".to_string(), "R".to_string()),
+                ]),
+            ),
+        );
+
+        let join = CrossJoinExec::new(
+            Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
+        );
+        let (expected, _) =
+            build_join_schema(&left_schema, &right_schema, &JoinType::Inner);
+        assert_eq!(join.schema().as_ref(), &expected);
+
+        // Swapping inputs restores column order and must not flip metadata.
+        let swapped = join.swap_inputs()?;
+        assert_eq!(swapped.schema().as_ref(), &expected);
+
+        Ok(())
     }
 
     #[tokio::test]

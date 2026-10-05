@@ -2150,7 +2150,7 @@ pub fn reorder_output_after_swap(
 ///
 /// Returns the expressions that will allow to swap back the values from the
 /// original left as the first columns and those on the right next.
-fn swap_reverting_projection(
+pub(crate) fn swap_reverting_projection(
     left_schema: &Schema,
     right_schema: &Schema,
 ) -> Vec<ProjectionExpr> {
