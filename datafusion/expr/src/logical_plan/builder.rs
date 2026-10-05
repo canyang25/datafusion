@@ -824,9 +824,35 @@ impl LogicalPlanBuilder {
         sorts: impl IntoIterator<Item = impl Into<SortExpr>> + Clone,
         fetch: Option<usize>,
     ) -> Result<Self> {
-        let sorts = rewrite_sort_cols_by_aggs(sorts, &self.plan)?;
+        let mut sorts = rewrite_sort_cols_by_aggs(sorts, &self.plan)?;
 
         let schema = self.plan.schema();
+
+        // `CAST(foo.column1 AS Utf8)` keeps the schema name `foo.column1`.
+        // `ORDER BY foo.column1` then looks missing from the projection and is
+        // added beside the cast, which fails the unique-name check. The name
+        // already belongs to the cast, so sort by that output column.
+        // https://github.com/apache/datafusion/issues/13558
+        if let LogicalPlan::Projection(projection) = self.plan.as_ref() {
+            for sort in &mut sorts {
+                let Expr::Column(column) = &sort.expr else {
+                    continue;
+                };
+                if schema.has_column(column) {
+                    continue;
+                }
+                let wanted = sort.expr.schema_name().to_string();
+                let Some(output) = projection
+                    .expr
+                    .iter()
+                    .find(|expr| expr.schema_name().to_string() == wanted)
+                else {
+                    continue;
+                };
+                let (qualifier, name) = output.qualified_name();
+                sort.expr = Expr::Column(Column::new(qualifier, name));
+            }
+        }
 
         // Collect sort columns that are missing in the input plan's schema
         let mut missing_cols: IndexSet<Column> = IndexSet::new();
@@ -2464,6 +2490,27 @@ mod tests {
         FunctionalDependencies, RecursionUnnestOption, SchemaError,
     };
     use insta::assert_snapshot;
+
+    /// `SELECT CAST(column1 AS Utf8) ORDER BY column1` must plan.
+    /// The cast's schema name is the input column, so adding that column for
+    /// the sort collides. https://github.com/apache/datafusion/issues/13558
+    #[test]
+    fn sort_cast_column_by_its_source_column() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("column1", DataType::Int32, true)]);
+        let plan = table_scan(Some("foo"), &schema, None)?
+            .project(vec![crate::expr_fn::cast(
+                col("foo.column1"),
+                DataType::Utf8,
+            )])?
+            .sort(vec![col("foo.column1").sort(true, true)])?
+            .build()?;
+        assert_snapshot!(plan, @r"
+        Sort: foo.column1 ASC NULLS FIRST
+          Projection: CAST(foo.column1 AS Utf8)
+            TableScan: foo
+        ");
+        Ok(())
+    }
 
     #[test]
     fn plan_builder_simple() -> Result<()> {

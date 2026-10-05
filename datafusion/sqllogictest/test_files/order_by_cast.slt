@@ -1,0 +1,42 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# ORDER BY a column that is only present as a cast in the select list.
+# https://github.com/apache/datafusion/issues/13558
+
+statement ok
+CREATE TABLE foo(column1 INT) AS VALUES (10), (2), (3);
+
+# The cast's output name is column1, so ORDER BY column1 sorts that text.
+query T
+SELECT cast(column1 AS VARCHAR) FROM foo ORDER BY column1;
+----
+10
+2
+3
+
+# An explicit alias does not take the input column's name, so ORDER BY
+# still sees the integer.
+query T
+SELECT cast(column1 AS VARCHAR) AS c FROM foo ORDER BY column1;
+----
+2
+3
+10
+
+statement ok
+DROP TABLE foo;
